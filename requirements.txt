@@ -1,5 +1,0 @@
-discord.py[voice]
-aiosqlite>=0.19.0
-PyNaCl
-davey
-yt-dlp[default]
