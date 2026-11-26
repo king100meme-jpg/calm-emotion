@@ -4,18 +4,18 @@ import logging
 import os
 import shutil
 import shlex
-import sys
 import time
 
 from collections import deque
 from urllib.parse import urlparse
 
 import discord
-from discord.ext import commands, tasks
 import yt_dlp
 
+from discord.ext import commands, tasks
 
-VERSION = "Music V3.1"
+
+VERSION = "Music V3.2"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("music")
@@ -27,17 +27,16 @@ log = logging.getLogger("music")
 
 def resolve(query):
 
-    opts = {
+    options = {
         "format": "bestaudio/best",
         "noplaylist": True,
-        "socket_timeout": 30,
-        "retries": 3,
         "quiet": True,
-        "no_warnings": False,
+        "socket_timeout": 30,
+        "retries": 2,
         "js_runtimes": {"deno": {}}
     }
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with yt_dlp.YoutubeDL(options) as ydl:
 
         data = ydl.extract_info(
             query,
@@ -46,12 +45,12 @@ def resolve(query):
 
         if data and "entries" in data:
             data = next(
-                (x for x in data["entries"] if x),
+                (entry for entry in data["entries"] if entry),
                 None
             )
 
         if not data or not data.get("url"):
-            raise ValueError("No playable audio found")
+            raise RuntimeError("No playable audio found")
 
         return data
 
@@ -61,12 +60,12 @@ def query_for(text, soundcloud=False):
     text = text.strip()
 
     if not text or len(text) > 500:
-        raise ValueError("اكتب اسم المقطع أو رابطاً صالحاً")
+        raise ValueError("اكتب اسم المقطع أو الرابط.")
 
     if "://" in text:
 
-        p = urlparse(text)
-        host = p.hostname or ""
+        parsed = urlparse(text)
+        host = parsed.hostname or ""
 
         domains = (
             "youtube.com",
@@ -74,12 +73,12 @@ def query_for(text, soundcloud=False):
             "soundcloud.com"
         )
 
-        if p.scheme not in ("http", "https") or not any(
-            host == d or host.endswith("." + d)
-            for d in domains
+        if parsed.scheme not in ("http", "https") or not any(
+            host == domain or host.endswith("." + domain)
+            for domain in domains
         ):
             raise ValueError(
-                "يدعم روابط YouTube وSoundCloud فقط"
+                "يدعم البوت YouTube وSoundCloud فقط."
             )
 
         return text
@@ -87,6 +86,47 @@ def query_for(text, soundcloud=False):
     return (
         "scsearch1:" if soundcloud else "ytsearch1:"
     ) + text
+
+
+# ==========================================
+# Audio Diagnostics
+# ==========================================
+
+class CheckedAudio(discord.AudioSource):
+
+    def __init__(self, source, label):
+
+        self.source = source
+        self.label = label
+        self.frames = 0
+
+    def read(self):
+
+        data = self.source.read()
+
+        if data:
+            self.frames += 1
+
+            if self.frames == 1:
+                log.info(
+                    "%s: first audio frame received",
+                    self.label
+                )
+
+        return data
+
+    def is_opus(self):
+        return self.source.is_opus()
+
+    def cleanup(self):
+
+        log.info(
+            "%s: audio frames=%s",
+            self.label,
+            self.frames
+        )
+
+        self.source.cleanup()
 
 
 # ==========================================
@@ -110,15 +150,19 @@ def create_bot(room_id, token_name):
     lock = asyncio.Lock()
 
     current = None
+    player_task = None
+
+    enabled = True
     repeat = False
     volume = 50
-    enabled = True
-    generation = 0
 
-    player_task = None
+    audio_mode = "pcm"
+
+    generation = 0
     position = 0.0
-    started = None
     seek_offset = 0.0
+
+    started = None
     duration = None
     track_title = None
 
@@ -133,16 +177,22 @@ def create_bot(room_id, token_name):
 
     def vc_now():
 
-        ch = room()
+        channel = room()
 
-        return ch.guild.voice_client if ch else None
+        return (
+            channel.guild.voice_client
+            if channel else None
+        )
 
 
     async def connect():
 
-        ch = room()
+        channel = room()
 
-        if not isinstance(ch, discord.VoiceChannel):
+        if not isinstance(
+            channel,
+            discord.VoiceChannel
+        ):
             raise RuntimeError("Voice room unavailable")
 
         vc = vc_now()
@@ -150,29 +200,48 @@ def create_bot(room_id, token_name):
         if vc and vc.is_connected():
 
             if vc.channel.id != room_id:
-                await vc.move_to(ch)
+                await vc.move_to(channel)
 
-            return vc
+        else:
 
-        if vc:
-            await vc.disconnect(force=True)
+            if vc:
+                await vc.disconnect(force=True)
 
-        return await ch.connect(
-            timeout=30,
-            reconnect=True,
-            self_deaf=True,
-            self_mute=False
-        )
+            vc = await channel.connect(
+                timeout=30,
+                reconnect=True,
+                self_deaf=True,
+                self_mute=False
+            )
+
+        if not channel.permissions_for(
+            channel.guild.me
+        ).speak:
+            raise RuntimeError("Missing Speak permission")
+
+        return vc
 
 
     @bot.check
     async def own_room(ctx):
 
+        voice = getattr(
+            ctx.author,
+            "voice",
+            None
+        )
+
+        channel = getattr(
+            voice,
+            "channel",
+            None
+        )
+
         return bool(
             ctx.guild
             and not ctx.author.bot
-            and getattr(ctx.author.voice, "channel", None)
-            and ctx.author.voice.channel.id == room_id
+            and channel
+            and channel.id == room_id
         )
 
 
@@ -182,74 +251,96 @@ def create_bot(room_id, token_name):
             await ctx.send(message)
 
         except discord.HTTPException:
-            log.warning("%s cannot send message", token_name)
+            log.warning(
+                "%s cannot send message",
+                token_name
+            )
 
 
     def elapsed_time():
 
+        if started is None:
+            return position
+
         return position + (
             time.monotonic() - started
-            if started is not None else 0
         )
 
 
     # ==========================================
-    # FFmpeg Opus Audio
+    # Audio Engine
     # ==========================================
 
     def create_audio(data, offset=0, test=False):
 
-        audio_filter = f"volume={volume / 100:.2f}"
-
-        options = (
-            "-vn -loglevel warning "
-            f"-af {audio_filter}"
-        )
-
         if test:
 
-            return discord.FFmpegOpusAudio(
-                "sine=frequency=440:duration=3",
-                before_options="-f lavfi",
-                options=options,
-                codec="libopus",
-                bitrate=128,
-                stderr=sys.stderr
+            url = "sine=frequency=440:duration=5"
+            before = "-f lavfi"
+
+        else:
+
+            url = data["url"]
+
+            before = (
+                "-reconnect 1 "
+                "-reconnect_streamed 1 "
+                "-reconnect_delay_max 5 "
+                "-rw_timeout 30000000"
             )
 
-        before = (
-            "-reconnect 1 "
-            "-reconnect_streamed 1 "
-            "-reconnect_delay_max 5 "
-            "-rw_timeout 30000000"
-        )
-
-        headers = data.get("http_headers") or {}
-
-        if headers:
+            headers = data.get("http_headers") or {}
 
             header = "".join(
-                f"{k}: {v}\r\n"
-                for k, v in headers.items()
-                if "\r" not in str(v)
-                and "\n" not in str(v)
-                and "\r" not in str(k)
-                and "\n" not in str(k)
+                f"{key}: {value}\r\n"
+                for key, value in headers.items()
+                if "\r" not in str(value)
+                and "\n" not in str(value)
+                and "\r" not in str(key)
+                and "\n" not in str(key)
             )
 
             if header:
-                before += " -headers " + shlex.quote(header)
+                before += (
+                    " -headers " + shlex.quote(header)
+                )
 
-        if offset:
-            before += f" -ss {offset:.3f}"
+            if offset:
+                before += f" -ss {offset:.3f}"
 
-        return discord.FFmpegOpusAudio(
-            data["url"],
-            before_options=before,
-            options=options,
-            codec="libopus",
-            bitrate=128,
-            stderr=sys.stderr
+        options = "-vn -loglevel warning"
+
+        if audio_mode == "opus":
+
+            source = discord.FFmpegOpusAudio(
+                url,
+                before_options=before,
+                options=(
+                    options
+                    + f" -af volume={volume / 100:.2f}"
+                ),
+                codec="libopus",
+                bitrate=128,
+                stderr=None
+            )
+
+        else:
+
+            source = discord.FFmpegPCMAudio(
+                url,
+                before_options=before,
+                options=options,
+                stderr=None
+            )
+
+            source = discord.PCMVolumeTransformer(
+                source,
+                volume=volume / 100
+            )
+
+        return CheckedAudio(
+            source,
+            token_name
         )
 
 
@@ -276,15 +367,15 @@ def create_bot(room_id, token_name):
                     current = item
                     ticket = generation
 
+                    offset = seek_offset
+                    seek_offset = 0.0
+
+                    position = offset
+                    started = None
+                    duration = None
+                    track_title = None
+
                 query, ctx = item
-
-                offset = seek_offset
-                seek_offset = 0.0
-
-                position = offset
-                started = None
-                duration = None
-                track_title = None
 
                 source = None
 
@@ -293,17 +384,21 @@ def create_bot(room_id, token_name):
                     is_test = query == "__test__"
 
                     log.info(
-                        "%s resolving audio",
-                        token_name
+                        "%s preparing audio mode=%s",
+                        token_name,
+                        audio_mode
                     )
 
-                    data = (
-                        None if is_test
-                        else await asyncio.to_thread(
+                    if is_test:
+
+                        data = None
+
+                    else:
+
+                        data = await asyncio.to_thread(
                             resolve,
                             query
                         )
-                    )
 
                     async with lock:
 
@@ -315,12 +410,7 @@ def create_bot(room_id, token_name):
                         if is_test:
 
                             title = "اختبار الصوت"
-                            duration = 3
-
-                            source = create_audio(
-                                None,
-                                test=True
-                            )
+                            duration = 5
 
                         else:
 
@@ -331,32 +421,37 @@ def create_bot(room_id, token_name):
 
                             duration = data.get("duration")
 
-                            source = create_audio(
-                                data,
-                                offset=offset
-                            )
+                        source = create_audio(
+                            data,
+                            offset=offset,
+                            test=is_test
+                        )
 
                         loop = asyncio.get_running_loop()
                         done = loop.create_future()
 
-                        def after(error, future=done, event_loop=loop):
-
-                            if error:
-                                log.error(
-                                    "%s audio error: %s",
-                                    token_name,
-                                    error
-                                )
-                            else:
-                                log.info(
-                                    "%s playback finished",
-                                    token_name
-                                )
+                        def after(
+                            error,
+                            future=done,
+                            event_loop=loop,
+                            audio=source
+                        ):
 
                             def finish():
 
                                 if not future.done():
-                                    future.set_result(error)
+
+                                    if (
+                                        error is None
+                                        and audio.frames == 0
+                                    ):
+                                        future.set_result(
+                                            RuntimeError(
+                                                "FFmpeg returned no audio frames"
+                                            )
+                                        )
+                                    else:
+                                        future.set_result(error)
 
                             event_loop.call_soon_threadsafe(
                                 finish
@@ -368,14 +463,15 @@ def create_bot(room_id, token_name):
                         )
 
                         source = None
+
                         track_title = title
                         started = time.monotonic()
 
                         log.info(
-                            "%s PLAYING | codec=opus | volume=%s | offset=%s",
+                            "%s PLAYING | mode=%s | volume=%s",
                             token_name,
-                            volume,
-                            offset
+                            audio_mode,
+                            volume
                         )
 
                     try:
@@ -388,20 +484,28 @@ def create_bot(room_id, token_name):
                             )
 
                     except discord.HTTPException:
-                        log.warning("Cannot send player panel")
+
+                        log.warning(
+                            "Cannot send player panel"
+                        )
 
                     error = await done
 
                     if error:
                         raise error
 
+                    log.info(
+                        "%s playback finished",
+                        token_name
+                    )
+
                     async with lock:
 
                         if (
                             repeat
                             and ticket == generation
-                            and not is_test
                             and enabled
+                            and not is_test
                         ):
                             queue.appendleft(item)
 
@@ -410,26 +514,26 @@ def create_bot(room_id, token_name):
                     if source:
                         source.cleanup()
 
+                    # Avoid printing signed media URLs.
+                    message = str(exc)
+
+                    if "http://" in message or "https://" in message:
+                        message = "Media URL omitted"
+
                     log.error(
-                        "%s playback failed (%s)",
+                        "%s PLAYBACK ERROR: %s: %s",
                         token_name,
-                        type(exc).__name__
+                        type(exc).__name__,
+                        message
                     )
 
-                    msg = str(exc).lower()
-
-                    if "403" in msg or "sign in" in msg:
+                    if ticket == generation:
 
                         await say(
                             ctx,
-                            "❌ المصدر رفض الاتصال. جرب SoundCloud."
-                        )
-
-                    else:
-
-                        await say(
-                            ctx,
-                            "❌ تعذر التشغيل. راجع Railway Logs."
+                            "❌ تعذر التشغيل: "
+                            + type(exc).__name__
+                            + "\nراجع Railway Logs."
                         )
 
                 finally:
@@ -473,13 +577,19 @@ def create_bot(room_id, token_name):
             or current[0] == "__test__"
             or not duration
             or not vc
-            or not (vc.is_playing() or vc.is_paused())
+            or not (
+                vc.is_playing()
+                or vc.is_paused()
+            )
         ):
             return False
 
         seek_offset = max(
             0,
-            min(max(0, duration - 1), seconds)
+            min(
+                max(0, duration - 1),
+                seconds
+            )
         )
 
         generation += 1
@@ -496,47 +606,67 @@ def create_bot(room_id, token_name):
 
         volume = max(0, min(100, level))
 
-        return restart_at(elapsed_time())
+        vc = vc_now()
+
+        if vc and isinstance(
+            vc.source,
+            CheckedAudio
+        ):
+
+            inner = vc.source.source
+
+            if isinstance(
+                inner,
+                discord.PCMVolumeTransformer
+            ):
+
+                inner.volume = volume / 100
+
+                return True
+
+            return restart_at(elapsed_time())
+
+        return False
 
 
     # ==========================================
-    # Automatic Voice Connection
+    # Auto Reconnect
     # ==========================================
 
-    @tasks.loop(seconds=30)
+    @tasks.loop(seconds=15)
     async def maintain():
 
-        if enabled and bot.is_ready():
+        if not enabled or not bot.is_ready():
+            return
 
-            try:
+        try:
 
-                async with lock:
-                    await connect()
+            async with lock:
+                await connect()
 
-            except Exception:
+        except Exception as exc:
 
-                log.exception(
-                    "%s voice reconnect failed",
-                    token_name
-                )
+            log.error(
+                "%s VOICE ERROR: %s",
+                token_name,
+                str(exc)
+            )
 
 
     @bot.event
     async def on_ready():
 
         log.info(
-            "%s | %s | Room=%s | FFmpeg=%s | Deno=%s | Discord=%s",
+            "%s | %s | FFmpeg=%s | Discord=%s",
             VERSION,
             token_name,
-            room_id,
             shutil.which("ffmpeg"),
-            shutil.which("deno"),
             discord.__version__
         )
 
         await bot.change_presence(
             activity=discord.Game(
-                name="#ش | #sc | #مساعدة"
+                name="#ش | #sc | #تحكم"
             )
         )
 
@@ -545,7 +675,7 @@ def create_bot(room_id, token_name):
 
 
     # ==========================================
-    # Play Command
+    # Music Commands
     # ==========================================
 
     @bot.command(
@@ -563,12 +693,17 @@ def create_bot(room_id, token_name):
                 ctx.invoked_with == "sc"
             )
 
-        except ValueError as e:
-            return await say(ctx, str(e))
+        except ValueError as exc:
+
+            return await say(
+                ctx,
+                str(exc)
+            )
 
         async with lock:
 
             if len(queue) >= 30:
+
                 return await say(
                     ctx,
                     "❌ القائمة ممتلئة."
@@ -577,7 +712,6 @@ def create_bot(room_id, token_name):
             enabled = True
 
             queue.append((query, ctx))
-
             start_player()
 
         await say(
@@ -585,10 +719,6 @@ def create_bot(room_id, token_name):
             "✅ تمت إضافة المقطع للقائمة."
         )
 
-
-    # ==========================================
-    # Audio Test
-    # ==========================================
 
     @bot.command(
         name="اختبار",
@@ -601,6 +731,7 @@ def create_bot(room_id, token_name):
         async with lock:
 
             if current or queue:
+
                 return await say(
                     ctx,
                     "استخدم #وقف أولاً."
@@ -608,19 +739,51 @@ def create_bot(room_id, token_name):
 
             enabled = True
 
-            queue.append(("__test__", ctx))
+            queue.append(
+                ("__test__", ctx)
+            )
 
             start_player()
 
         await say(
             ctx,
-            "🔊 اختبار الصوت باستخدام Opus لمدة 3 ثوان."
+            f"🔊 اختبار الصوت لمدة 5 ثوان | {audio_mode}"
         )
 
 
-    # ==========================================
-    # Stop
-    # ==========================================
+    @bot.command(
+        name="نظام",
+        aliases=["codec"]
+    )
+    async def set_codec(ctx, mode=""):
+
+        nonlocal audio_mode
+
+        mode = mode.lower()
+
+        if mode not in ("pcm", "opus"):
+
+            return await say(
+                ctx,
+                "استخدم #نظام pcm أو #نظام opus"
+            )
+
+        async with lock:
+
+            if current or queue:
+
+                return await say(
+                    ctx,
+                    "استخدم #وقف أولاً."
+                )
+
+            audio_mode = mode
+
+        await say(
+            ctx,
+            f"✅ نظام الصوت: {audio_mode}"
+        )
+
 
     @bot.command(
         name="وقف",
@@ -633,7 +796,7 @@ def create_bot(room_id, token_name):
         async with lock:
 
             generation += 1
-            seek_offset = 0.0
+            seek_offset = 0
             repeat = False
 
             queue.clear()
@@ -645,13 +808,9 @@ def create_bot(room_id, token_name):
 
         await say(
             ctx,
-            "⏹️ تم إيقاف التشغيل ومسح القائمة."
+            "⏹️ تم إيقاف التشغيل."
         )
 
-
-    # ==========================================
-    # Skip
-    # ==========================================
 
     @bot.command(
         name="تخطي",
@@ -664,7 +823,7 @@ def create_bot(room_id, token_name):
         async with lock:
 
             generation += 1
-            seek_offset = 0.0
+            seek_offset = 0
 
             vc = vc_now()
 
@@ -676,10 +835,6 @@ def create_bot(room_id, token_name):
             "⏭️ تم التخطي."
         )
 
-
-    # ==========================================
-    # Pause And Resume
-    # ==========================================
 
     @bot.command(
         name="مؤقت",
@@ -695,10 +850,10 @@ def create_bot(room_id, token_name):
 
             if vc and vc.is_playing():
 
-                vc.pause()
-
                 position = elapsed_time()
                 started = None
+
+                vc.pause()
 
                 message = "⏸️ تم الإيقاف المؤقت."
 
@@ -724,7 +879,6 @@ def create_bot(room_id, token_name):
             if vc and vc.is_paused():
 
                 vc.resume()
-
                 started = time.monotonic()
 
                 message = "▶️ تم الاستكمال."
@@ -735,10 +889,6 @@ def create_bot(room_id, token_name):
 
         await say(ctx, message)
 
-
-    # ==========================================
-    # Volume
-    # ==========================================
 
     @bot.command(
         name="صوت",
@@ -758,10 +908,6 @@ def create_bot(room_id, token_name):
         await say(ctx, message)
 
 
-    # ==========================================
-    # Repeat
-    # ==========================================
-
     @bot.command(
         name="تكرار",
         aliases=["loop"]
@@ -770,8 +916,7 @@ def create_bot(room_id, token_name):
 
         nonlocal repeat
 
-        async with lock:
-            repeat = not repeat
+        repeat = not repeat
 
         await say(
             ctx,
@@ -780,10 +925,6 @@ def create_bot(room_id, token_name):
         )
 
 
-    # ==========================================
-    # Queue
-    # ==========================================
-
     @bot.command(
         name="قائمة",
         aliases=["queue"]
@@ -791,20 +932,16 @@ def create_bot(room_id, token_name):
     async def list_queue(ctx):
 
         lines = [
-            f"{i}. {discord.utils.escape_markdown(q[:100])}"
+            f"{i}. {q[:100]}"
             for i, (q, _) in enumerate(queue, 1)
         ]
 
         await say(
             ctx,
-            ("\n".join(lines))[:1900]
+            "\n".join(lines)[:1900]
             if lines else "القائمة فارغة."
         )
 
-
-    # ==========================================
-    # Join And Leave
-    # ==========================================
 
     @bot.command(
         name="دخول",
@@ -817,7 +954,6 @@ def create_bot(room_id, token_name):
         async with lock:
 
             enabled = True
-
             await connect()
 
         await say(
@@ -839,8 +975,8 @@ def create_bot(room_id, token_name):
 
             enabled = False
             generation += 1
+            seek_offset = 0
             repeat = False
-            seek_offset = 0.0
 
             queue.clear()
 
@@ -850,7 +986,9 @@ def create_bot(room_id, token_name):
 
                 vc.stop()
 
-                await vc.disconnect(force=True)
+                await vc.disconnect(
+                    force=True
+                )
 
         await say(
             ctx,
@@ -859,28 +997,30 @@ def create_bot(room_id, token_name):
 
 
     # ==========================================
-    # Music Control Panel
+    # Control Panel
     # ==========================================
 
     def panel_embed():
 
         elapsed = int(elapsed_time())
-
         vc = vc_now()
 
         if vc and vc.is_paused():
+
             status = "متوقف مؤقتاً"
 
         elif vc and vc.is_playing():
+
             status = "يعمل"
 
         else:
+
             status = "لا يوجد تشغيل"
 
         embed = discord.Embed(
             title="🎵 لوحة التحكم بالأغاني",
             description=discord.utils.escape_markdown(
-                track_title or "لا يوجد مقطع جاهز"
+                track_title or "لا يوجد مقطع"
             ),
             color=0x5865F2
         )
@@ -910,8 +1050,13 @@ def create_bot(room_id, token_name):
             value="مفعل" if repeat else "متوقف"
         )
 
+        embed.add_field(
+            name="نظام الصوت",
+            value=audio_mode.upper()
+        )
+
         embed.set_footer(
-            text=VERSION + " | Opus Audio"
+            text=VERSION
         )
 
         return embed
@@ -924,7 +1069,10 @@ def create_bot(room_id, token_name):
     class Controls(discord.ui.View):
 
         def __init__(self):
-            super().__init__(timeout=3600)
+
+            super().__init__(
+                timeout=3600
+            )
 
 
         async def interaction_check(self, interaction):
@@ -945,7 +1093,7 @@ def create_bot(room_id, token_name):
                 return True
 
             await interaction.response.send_message(
-                "ادخل الروم المخصص لهذا البوت.",
+                "ادخل الروم المخصص للبوت.",
                 ephemeral=True
             )
 
@@ -954,8 +1102,8 @@ def create_bot(room_id, token_name):
 
         async def action(self, interaction, action):
 
-            nonlocal position, started, volume
-            nonlocal repeat, generation, seek_offset
+            nonlocal position, started
+            nonlocal generation, seek_offset, repeat
 
             await interaction.response.defer()
 
@@ -974,14 +1122,13 @@ def create_bot(room_id, token_name):
 
                     elif vc and vc.is_playing():
 
-                        vc.pause()
                         position = elapsed_time()
                         started = None
+                        vc.pause()
 
                     else:
 
                         msg = "لا يوجد مقطع يعمل."
-
 
                 elif action in ("back", "forward"):
 
@@ -991,12 +1138,13 @@ def create_bot(room_id, token_name):
 
                     if restart_at(seconds):
 
-                        msg = f"⏩ الانتقال إلى {int(seek_offset)} ثانية."
+                        msg = (
+                            f"الانتقال إلى {int(seek_offset)} ثانية."
+                        )
 
                     else:
 
-                        msg = "التقديم والترجيع غير متاح لهذا المقطع."
-
+                        msg = "التقديم والترجيع غير متاح."
 
                 elif action in ("down", "up"):
 
@@ -1011,25 +1159,22 @@ def create_bot(room_id, token_name):
                     if not applied:
                         msg += " | يطبق عند التشغيل القادم."
 
-
                 elif action in ("skip", "stop"):
 
                     generation += 1
-                    seek_offset = 0.0
+                    seek_offset = 0
 
                     if action == "stop":
 
-                        queue.clear()
                         repeat = False
+                        queue.clear()
 
                     if vc:
                         vc.stop()
 
-
                 elif action == "repeat":
 
                     repeat = not repeat
-
 
                 elif action == "queue":
 
@@ -1040,7 +1185,6 @@ def create_bot(room_id, token_name):
                         )
                         or "القائمة فارغة."
                     )[:1900]
-
 
             await interaction.edit_original_response(
                 embed=panel_embed(),
@@ -1062,7 +1206,10 @@ def create_bot(room_id, token_name):
         )
         async def button_0(self, interaction, button):
 
-            await self.action(interaction, "back")
+            await self.action(
+                interaction,
+                "back"
+            )
 
 
         @discord.ui.button(
@@ -1072,7 +1219,10 @@ def create_bot(room_id, token_name):
         )
         async def button_1(self, interaction, button):
 
-            await self.action(interaction, "toggle")
+            await self.action(
+                interaction,
+                "toggle"
+            )
 
 
         @discord.ui.button(
@@ -1082,7 +1232,10 @@ def create_bot(room_id, token_name):
         )
         async def button_2(self, interaction, button):
 
-            await self.action(interaction, "forward")
+            await self.action(
+                interaction,
+                "forward"
+            )
 
 
         @discord.ui.button(
@@ -1092,17 +1245,23 @@ def create_bot(room_id, token_name):
         )
         async def button_3(self, interaction, button):
 
-            await self.action(interaction, "skip")
+            await self.action(
+                interaction,
+                "skip"
+            )
 
 
         @discord.ui.button(
             label="⏹ إيقاف",
-            style=discord.ButtonStyle.secondary,
+            style=discord.ButtonStyle.danger,
             row=0
         )
         async def button_4(self, interaction, button):
 
-            await self.action(interaction, "stop")
+            await self.action(
+                interaction,
+                "stop"
+            )
 
 
         @discord.ui.button(
@@ -1112,7 +1271,10 @@ def create_bot(room_id, token_name):
         )
         async def button_5(self, interaction, button):
 
-            await self.action(interaction, "down")
+            await self.action(
+                interaction,
+                "down"
+            )
 
 
         @discord.ui.button(
@@ -1122,7 +1284,10 @@ def create_bot(room_id, token_name):
         )
         async def button_6(self, interaction, button):
 
-            await self.action(interaction, "up")
+            await self.action(
+                interaction,
+                "up"
+            )
 
 
         @discord.ui.button(
@@ -1132,7 +1297,10 @@ def create_bot(room_id, token_name):
         )
         async def button_7(self, interaction, button):
 
-            await self.action(interaction, "repeat")
+            await self.action(
+                interaction,
+                "repeat"
+            )
 
 
         @discord.ui.button(
@@ -1142,7 +1310,10 @@ def create_bot(room_id, token_name):
         )
         async def button_8(self, interaction, button):
 
-            await self.action(interaction, "queue")
+            await self.action(
+                interaction,
+                "queue"
+            )
 
 
         @discord.ui.button(
@@ -1152,12 +1323,11 @@ def create_bot(room_id, token_name):
         )
         async def button_9(self, interaction, button):
 
-            await self.action(interaction, "refresh")
+            await self.action(
+                interaction,
+                "refresh"
+            )
 
-
-    # ==========================================
-    # Panel Command
-    # ==========================================
 
     @bot.command(
         name="تحكم",
@@ -1170,10 +1340,6 @@ def create_bot(room_id, token_name):
             view=Controls()
         )
 
-
-    # ==========================================
-    # Help
-    # ==========================================
 
     @bot.command(
         name="مساعدة",
@@ -1188,6 +1354,8 @@ def create_bot(room_id, token_name):
             "#sc اسم الأغنية\n"
             "#تحكم\n"
             "#اختبار\n"
+            "#نظام pcm\n"
+            "#نظام opus\n"
             "#وقف\n"
             "#تخطي\n"
             "#مؤقت\n"
@@ -1199,10 +1367,6 @@ def create_bot(room_id, token_name):
             "#طلوع"
         )
 
-
-    # ==========================================
-    # Error Handler
-    # ==========================================
 
     @bot.event
     async def on_command_error(ctx, error):
@@ -1217,14 +1381,15 @@ def create_bot(room_id, token_name):
             return
 
         log.error(
-            "%s command error: %s",
+            "%s COMMAND ERROR: %s",
             token_name,
             type(error).__name__
         )
 
         await say(
             ctx,
-            "❌ تعذر تنفيذ الأمر."
+            "❌ تعذر تنفيذ الأمر: "
+            + type(error).__name__
         )
 
 
@@ -1246,7 +1411,10 @@ def run(room_id, token_name):
         )
 
     if not shutil.which("ffmpeg"):
-        raise RuntimeError("FFmpeg missing")
+
+        raise RuntimeError(
+            "FFmpeg missing"
+        )
 
     create_bot(
         room_id,
